@@ -36,7 +36,7 @@ type healthError struct {
 
 // MonitorExternal concurrently monitors external service health and if they are unhealthy,
 // records the status in a map
-func MonitorExternal(clients ...Client) {
+func MonitorExternal(clients ...Client) bool {
 	hs := make(HealthState)
 
 	type externalError struct {
@@ -76,6 +76,8 @@ func MonitorExternal(clients ...Client) {
 		healthLastSuccess = healthLastChecked
 	}
 	mutex.Unlock()
+
+	return len(hs) == 0
 }
 
 // Do is responsible for returning the healthcheck status to the user

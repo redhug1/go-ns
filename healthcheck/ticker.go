@@ -10,7 +10,6 @@ import (
 // Ticker calls the health check monitor function at configured intervals.
 type Ticker struct {
 	timeTicker *time.Ticker
-	asyncCheck chan bool
 	closing    chan bool
 	closed     chan bool
 }
@@ -41,27 +40,18 @@ func NewTickerWithAlerts(
 		closed:     make(chan bool),
 	}
 
-	asyncCheck := make(chan bool)
+	var (
+		// mutexChecking locks the below vars, and also locks MonitorExternal
+		mutexChecking      sync.Mutex
+		lastCheckStarted   time.Time
+		lastCheckCompleted time.Time
+	)
 
-	// mutexChecking locks the below vars, and also locks MonitorExternal
-	var mutexChecking sync.Mutex
-	var lastCheckStarted time.Time
-	var lastCheckCompleted time.Time
-
-	// mutexCurrentHealthOK locks the below var
-	var mutexCurrentHealthOK sync.Mutex
-	var currentHealthOK bool
-
-	// create recovery ticks which initiate a healthcheck only on startup and when unhealthy
-	go func() {
-		for range time.Tick(recoveryDuration) {
-			mutexCurrentHealthOK.Lock()
-			if !currentHealthOK {
-				asyncCheck <- true
-			}
-			mutexCurrentHealthOK.Unlock()
-		}
-	}()
+	var (
+		// mutexCurrentHealthOK locks the below var
+		mutexCurrentHealthOK sync.Mutex
+		currentHealthOK      bool
+	)
 
 	// main goroutine to run MonitorExternal at intervals, and send any health state changes
 	go func() {
@@ -71,8 +61,16 @@ func NewTickerWithAlerts(
 			select {
 			case <-ticker.closing:
 				return
-			case <-asyncCheck:
-			case <-ticker.timeTicker.C:
+			case <-time.Tick(recoveryDuration): // recovery ticks which initiate a healthcheck only on startup and when unhealthy
+				mutexCurrentHealthOK.Lock()
+				if currentHealthOK {
+					mutexCurrentHealthOK.Unlock()
+					continue
+				}
+				mutexCurrentHealthOK.Unlock()
+
+			case <-ticker.timeTicker.C: // kick off healthcheck once every 'duration'
+
 			case claimedNewHealthOK := <-requestCheckChan:
 				mutexCurrentHealthOK.Lock()
 				logData := log.Data{"prev_health": currentHealthOK, "new_health": claimedNewHealthOK}
@@ -104,18 +102,15 @@ func NewTickerWithAlerts(
 
 				lastCheckStarted = now
 
-				// run check in the background,  mutexChecking.Lock() applies
+				// run check in the background, mutexChecking.Lock() applies
 				go func() {
 
 					log.Debug("conducting service healthcheck", nil)
-					MonitorExternal(clients...)
+					newHealthOK := MonitorExternal(clients...)
 
 					lastCheckCompleted = time.Now()
 					mutexChecking.Unlock()
 
-					// if the new state has changed, change currentHealthOK, and if the channel for state changes exists, signal the channel
-					newState, _, _ := GetState()
-					newHealthOK := len(newState) == 0
 					mutexCurrentHealthOK.Lock()
 					defer mutexCurrentHealthOK.Unlock()
 					if currentHealthOK != newHealthOK {
